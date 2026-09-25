@@ -100,6 +100,10 @@ async def run_entity_agent(ctx: CaseContext) -> EntityResolutionState:
     order_data: dict[str, Any] | None = None
 
     for cand in candidates:
+        if cand.startswith("candidate-") or len(cand) != 32:
+            rejected_candidates.append(cand)
+            continue
+
         evidence = await ctx.call_tool(actor, "get_order", order_id=cand)
         if evidence and evidence.get("data"):
             resolved_order_ids.append(cand)
@@ -192,9 +196,6 @@ async def run_order_agent(ctx: CaseContext) -> OrderContextState:
             prod_ev = await ctx.call_tool(actor, "get_product_context", order_id=resolved_order_id)
             if prod_ev and prod_ev.get("data"):
                 res.products = prod_ev["data"]
-
-        # Sellers
-        await ctx.call_tool(actor, "get_sellers", order_id=resolved_order_id)
 
     ctx.state.order_context = res
     ctx.trace.emit(
@@ -324,19 +325,27 @@ async def run_payment_agent(ctx: CaseContext) -> PaymentState:
                     has_reconciliation_mismatch = True
             res.captured_total_brl = captured_sum
 
-        # Refund timeline (optional / may error if no refund)
-        ev_ref = await ctx.call_tool(actor, "get_refund_timeline", order_id=resolved_order_id)
-        if ev_ref and ev_ref.get("data"):
-            refund_data = ev_ref["data"]
-            res.refund_events = refund_data.get("events", [])
-            refunded_sum = 0.0
-            for ev in res.refund_events:
-                if ev.get("status") == "confirmed":
-                    try:
-                        refunded_sum += float(ev.get("amount_brl", 0))
-                    except (ValueError, TypeError):
-                        pass
-            res.refunded_total_brl = refunded_sum
+        # Refund timeline only when relevant to case to conserve call budget
+        has_refund_context = (
+            any("refund" in c.get("topic", "") for c in ctx.state.customer_request.get("claims", []))
+            or (ctx.state.entity.order_data and ctx.state.entity.order_data.get("order_status") in ("canceled", "unavailable"))
+            or any("refund" in ev.get("event_type", "") for ev in res.payment_events)
+        )
+        if has_refund_context:
+            ev_ref = await ctx.call_tool(actor, "get_refund_timeline", order_id=resolved_order_id)
+            if ev_ref and ev_ref.get("data"):
+                refund_data = ev_ref["data"]
+                res.refund_events = refund_data.get("events", [])
+                refunded_sum = 0.0
+                for ev in res.refund_events:
+                    if ev.get("status") == "confirmed":
+                        try:
+                            refunded_sum += float(ev.get("amount_brl", 0))
+                        except (ValueError, TypeError):
+                            pass
+                res.refunded_total_brl = refunded_sum
+            else:
+                res.refunded_total_brl = 0.0
         else:
             res.refunded_total_brl = 0.0
 
@@ -539,16 +548,16 @@ async def run_policy_agent(ctx: CaseContext) -> PolicyDecisionState:
 
     # Evidence mapping by claim topic for relevance filtering
     _TOPIC_EV_CATS: dict[str, list[str]] = {
-        "late_delivery_logistics": ["shipment", "order"],
+        "late_delivery_logistics": ["shipment"],
         "late_delivery_seller": ["shipment", "order"],
-        "canceled_order_paid": ["entity", "order", "payment"],
-        "unavailable_order_paid": ["entity", "order", "payment"],
+        "canceled_order_paid": ["entity", "payment"],
+        "unavailable_order_paid": ["entity", "payment"],
         "payment_mismatch": ["payment"],
         "duplicate_charge": ["payment"],
         "refund_pending": ["payment"],
         "refund_failed": ["payment"],
-        "valid_split_payment": ["payment", "order"],
-        "unsupported_claim": ["entity", "policy"],
+        "valid_split_payment": ["payment"],
+        "unsupported_claim": ["policy", "shipment"],
         "requested_full_refund": ["payment", "policy"],
     }
 
@@ -567,7 +576,7 @@ async def run_policy_agent(ctx: CaseContext) -> PolicyDecisionState:
                 if ref not in claim_ev:
                     claim_ev.append(ref)
         if not claim_ev:
-            claim_ev = all_evidence  # Fallback to all evidence
+            claim_ev = all_evidence[:3]  # Precise fallback
 
         if ctopic == primary_issue:
             verdict = "supported"
